@@ -3,6 +3,8 @@ import discord
 from datetime import datetime
 import google.generativeai as genai
 from dotenv import load_dotenv
+import re
+import aiohttp
 
 # =========================
 # LOAD ENV
@@ -106,6 +108,17 @@ async def on_raw_reaction_add(payload):
     emoji = str(payload.emoji)
     debug_log(f"Reaction received: {emoji} from user {payload.user_id}")
 
+    # Handle ping command
+    if emoji == "🏓":
+        latency = round(client.latency * 1000)
+        debug_log(f"Ping requested. Latency: {latency}ms")
+        
+        channel = client.get_channel(payload.channel_id)
+        if channel:
+            message = await channel.fetch_message(payload.message_id)
+            await message.reply(f"🏓 Pong! Latency: **{latency}ms**")
+        return
+
     if emoji not in LANGUAGES:
         debug_log(f"Emoji {emoji} not in supported LANGUAGES.")
         return
@@ -134,6 +147,9 @@ async def on_raw_reaction_add(payload):
         print(f"Translating to {target_language}")
         debug_log(f"Original content: {message.content[:50]}...")
 
+        # PROCESS TWEET LINKS
+        text_to_translate = await extract_tweet_text(message.content)
+
         # =========================
         # CALL GEMINI API
         # =========================
@@ -141,7 +157,7 @@ async def on_raw_reaction_add(payload):
         prompt = (
             f"Translate to {target_language}. "
             "Preserve tone, slang, and formatting. Output ONLY the translation.\n\n"
-            f"Content: {message.content}"
+            f"Content: {text_to_translate}" # <--- Updated variable here
         )
         
         debug_log("Calling Gemini API...")
@@ -167,6 +183,51 @@ async def on_raw_reaction_add(payload):
         print("Translation error:")
         print(e)
         debug_log(f"Exception details: {type(e).__name__}: {str(e)}")
+
+# =========================
+# X/TWITTER FETCHER
+# =========================
+
+async def extract_tweet_text(content: str) -> str:
+    """
+    Checks if the message contains a Twitter/X or alternative (vxtwitter, fixvx, etc.) URL. 
+    If so, fetches the tweet text via the vxtwitter API and appends it to the content.
+    """
+    # Regex updated to catch x, twitter, vxtwitter, fxtwitter, fixupx, and fixvx
+    # Group 1 captures the username, Group 2 captures the status ID
+    twitter_pattern = re.compile(
+        r'https?://(?:www\.)?(?:twitter\.com|x\.com|vxtwitter\.com|fxtwitter\.com|fixupx\.com|fixvx\.com)/([a-zA-Z0-9_]+)/status/([0-9]+)'
+    )
+    match = twitter_pattern.search(content)
+
+    if not match:
+        return content # No link found, return original content
+
+    username = match.group(1)
+    tweet_id = match.group(2)
+    
+    # Construct the API URL cleanly using the extracted username and ID
+    api_url = f"https://api.vxtwitter.com/{username}/status/{tweet_id}"
+    
+    debug_log(f"Detected X/Twitter link. Fetching from {api_url}")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    tweet_text = data.get('text', '')
+                    if tweet_text:
+                        debug_log("Successfully fetched tweet content.")
+                        # Return the original message plus the extracted tweet text
+                        return f"{content}\n\n**[Extracted Tweet Text]:**\n{tweet_text}"
+                else:
+                    debug_log(f"Failed to fetch tweet. Status code: {response.status}")
+    except Exception as e:
+        debug_log(f"Error fetching tweet: {e}")
+
+    # Fallback to original content if fetch fails
+    return content
 
 # =========================
 # START BOT

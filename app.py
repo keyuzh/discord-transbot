@@ -97,6 +97,17 @@ async def on_raw_reaction_add(payload):
     emoji = str(payload.emoji)
     debug_log(f"Reaction received: {emoji} from user {payload.user_id}")
 
+    # Handle ping command
+    if emoji == "🏓":
+        latency = round(client.latency * 1000)
+        debug_log(f"Ping requested. Latency: {latency}ms")
+        
+        channel = client.get_channel(payload.channel_id)
+        if channel:
+            message = await channel.fetch_message(payload.message_id)
+            await message.reply(f"🏓 Pong! Latency: **{latency}ms**")
+        return
+
     # only process flag emojis
     if emoji not in LANGUAGES:
         debug_log(f"Emoji {emoji} not in supported LANGUAGES.")
