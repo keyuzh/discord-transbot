@@ -3,6 +3,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# CodeGraph local index
+.codegraph/
+
 # C extensions
 *.so
 

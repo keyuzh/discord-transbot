@@ -4,3 +4,6 @@ google-generativeai
 python-dotenv
 aiohttp
 certifi
+paddleocr
+paddlepaddle
+requests
