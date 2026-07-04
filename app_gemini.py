@@ -1,237 +1,85 @@
+"""Discord translation bot backed by Google Gemini, with X/Twitter link expansion."""
+
+import asyncio
 import os
-import discord
-from datetime import datetime
-import google.generativeai as genai
-from dotenv import load_dotenv
 import re
+
 import aiohttp
+from google import genai
+from google.genai import types
 
-# =========================
-# LOAD ENV
-# =========================
+import bot  # imports first so load_dotenv() runs before we read the key
 
-load_dotenv()
+API_KEY = bot.require_env("GEMINI_API_KEY")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+MAX_TWEETS = 3
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+# One client for the whole process; its connection pool is reused across requests.
+client = genai.Client(api_key=API_KEY)
 
-# =========================
-# DEBUG PRINT
-# =========================
+# Sampling params are static; only the system instruction varies per request.
+_GEN_PARAMS = dict(temperature=0.3, top_p=0.95, top_k=40, max_output_tokens=8192)
 
-def debug_log(message):
-    if DEBUG_MODE:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{timestamp}] [DEBUG] {message}")
-
-# =========================
-# GEMINI CONFIG
-# =========================
-
-genai.configure(api_key=GEMINI_API_KEY)
-
-# Generation config
-generation_config = {
-  "temperature": 0.3,
-  "top_p": 0.95,
-  "top_k": 40,
-  "max_output_tokens": 8192,
-  "response_mime_type": "text/plain",
-}
-
-model = genai.GenerativeModel(
-  model_name="gemini-3.1-flash-lite",
-  generation_config=generation_config,
+# Matches twitter/x and the usual mirror domains, capturing (username, status_id).
+_TWEET_RE = re.compile(
+    r"https?://(?:www\.)?"
+    r"(?:twitter\.com|x\.com|vxtwitter\.com|fxtwitter\.com|fixupx\.com|fixvx\.com)"
+    r"/([A-Za-z0-9_]+)/status/([0-9]+)"
 )
 
-# =========================
-# DISCORD INTENTS
-# =========================
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.reactions = True
-intents.messages = True
-intents.guilds = True
-
-# =========================
-# DISCORD CLIENT
-# =========================
-
-client = discord.Client(intents=intents)
-
-# =========================
-# FLAG -> LANGUAGE
-# =========================
-
-LANGUAGES = {
-    "🇺🇸": "English",
-    "🇬🇧": "English",
-    "🇯🇵": "Japanese",
-    "🇨🇳": "Chinese",
-    "🇹🇼": "Chinese",
-    "🇰🇷": "Korean",
-    "🇫🇷": "French",
-    "🇪🇸": "Spanish",
-    "🇲🇽": "Spanish",
-    "🇩🇪": "German",
-    "🇷🇺": "Russian"
-}
-
-# =========================
-# CACHE
-# =========================
-
-translated_cache = set()
-
-# =========================
-# READY EVENT
-# =========================
-
-@client.event
-async def on_ready():
-    print("=" * 50)
-    print(f"Logged in as {client.user}")
-    print("Translation bot (Gemini Direct) is online.")
-    print("=" * 50)
-
-# =========================
-# REACTION EVENT
-# =========================
-
-@client.event
-async def on_raw_reaction_add(payload):
-    if payload.user_id == client.user.id:
-        return
-
-    emoji = str(payload.emoji)
-    debug_log(f"Reaction received: {emoji} from user {payload.user_id}")
-
-    # Handle ping command
-    if emoji == "🏓":
-        latency = round(client.latency * 1000)
-        debug_log(f"Ping requested. Latency: {latency}ms")
-        
-        channel = client.get_channel(payload.channel_id)
-        if channel:
-            message = await channel.fetch_message(payload.message_id)
-            await message.reply(f"🏓 Pong! Latency: **{latency}ms**")
-        return
-
-    if emoji not in LANGUAGES:
-        debug_log(f"Emoji {emoji} not in supported LANGUAGES.")
-        return
-
-    cache_key = (payload.message_id, emoji)
-    if cache_key in translated_cache:
-        debug_log(f"Translation for {cache_key} already in cache. Skipping.")
-        return
-
-    translated_cache.add(cache_key)
-
-    try:
-        channel = client.get_channel(payload.channel_id)
-        if channel is None:
-            debug_log(f"Channel {payload.channel_id} not found.")
-            return
-
-        debug_log(f"Fetching message {payload.message_id}...")
-        message = await channel.fetch_message(payload.message_id)
-
-        if message.author.bot or not message.content:
-            debug_log("Ignoring bot message or empty content.")
-            return
-
-        target_language = LANGUAGES[emoji]
-        print(f"Translating to {target_language}")
-        debug_log(f"Original content: {message.content[:50]}...")
-
-        # PROCESS TWEET LINKS
-        text_to_translate = await extract_tweet_text(message.content)
-
-        # =========================
-        # CALL GEMINI API
-        # =========================
-        
-        prompt = (
-            f"Translate to {target_language}. "
-            "Preserve tone, slang, and formatting. Output ONLY the translation.\n\n"
-            f"Content: {text_to_translate}" # <--- Updated variable here
-        )
-        
-        debug_log("Calling Gemini API...")
-        response = await model.generate_content_async(prompt)
-        translated = response.text
-        
-        debug_log(f"Translation received: {translated[:50]}...")
-
-        # =========================
-        # EMBED
-        # =========================
-
-        embed = discord.Embed(
-            title=f"{emoji} Translation",
-            description=translated
-        )
-        embed.set_footer(text=f"Model: {model.model_name}")
-
-        debug_log(f"Replying to message {payload.message_id} with translation.")
-        await message.reply(embed=embed)
-
-    except Exception as e:
-        print("Translation error:")
-        print(e)
-        debug_log(f"Exception details: {type(e).__name__}: {str(e)}")
-
-# =========================
-# X/TWITTER FETCHER
-# =========================
-
-async def extract_tweet_text(content: str) -> str:
-    """
-    Checks if the message contains a Twitter/X or alternative (vxtwitter, fixvx, etc.) URL. 
-    If so, fetches the tweet text via the vxtwitter API and appends it to the content.
-    """
-    # Regex updated to catch x, twitter, vxtwitter, fxtwitter, fixupx, and fixvx
-    # Group 1 captures the username, Group 2 captures the status ID
-    twitter_pattern = re.compile(
-        r'https?://(?:www\.)?(?:twitter\.com|x\.com|vxtwitter\.com|fxtwitter\.com|fixupx\.com|fixvx\.com)/([a-zA-Z0-9_]+)/status/([0-9]+)'
-    )
-    match = twitter_pattern.search(content)
-
-    if not match:
-        return content # No link found, return original content
-
-    username = match.group(1)
-    tweet_id = match.group(2)
-    
-    # Construct the API URL cleanly using the extracted username and ID
+async def _fetch_tweet(session: aiohttp.ClientSession, username: str, tweet_id: str) -> str:
     api_url = f"https://api.vxtwitter.com/{username}/status/{tweet_id}"
-    
-    debug_log(f"Detected X/Twitter link. Fetching from {api_url}")
-
+    bot.log.debug("Fetching tweet from %s", api_url)
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(api_url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    tweet_text = data.get('text', '')
-                    if tweet_text:
-                        debug_log("Successfully fetched tweet content.")
-                        # Return the original message plus the extracted tweet text
-                        return f"{content}\n\n**[Extracted Tweet Text]:**\n{tweet_text}"
-                else:
-                    debug_log(f"Failed to fetch tweet. Status code: {response.status}")
-    except Exception as e:
-        debug_log(f"Error fetching tweet: {e}")
+        async with session.get(api_url) as response:
+            if response.status == 200:
+                return (await response.json()).get("text", "")
+            bot.log.warning("Tweet fetch returned HTTP %s", response.status)
+    except Exception:
+        bot.log.exception("Tweet fetch failed")
+    return ""
 
-    # Fallback to original content if fetch fails
-    return content
 
-# =========================
-# START BOT
-# =========================
+async def _expand_tweets(content: str) -> str:
+    """Append the text of any X/Twitter links so the model can translate them."""
+    matches = _TWEET_RE.findall(content)[:MAX_TWEETS]
+    if not matches:
+        return content
 
-if __name__ == '__main__':
-    client.run(DISCORD_TOKEN)
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        texts = await asyncio.gather(*(_fetch_tweet(session, u, t) for u, t in matches))
+
+    extracted = "\n\n".join(f"**[Extracted Tweet Text]:**\n{t}" for t in texts if t)
+    return f"{content}\n\n{extracted}" if extracted else content
+
+
+async def translate(
+    content: str, target_language: str, images: list[tuple[bytes, str]]
+) -> tuple[str, str]:
+    text = await _expand_tweets(content) if content else ""
+    parts = [types.Part.from_bytes(data=data, mime_type=mime) for data, mime in images]
+    contents = [text, *parts] if text else parts
+
+    response = await client.aio.models.generate_content(
+        model=MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=bot.build_prompt(target_language), **_GEN_PARAMS
+        ),
+    )
+
+    # `.text` is None when the reply was blocked or has no text parts.
+    translated = response.text
+    if not translated:
+        bot.log.warning(
+            "Gemini returned no content: %s", getattr(response, "prompt_feedback", None)
+        )
+        return "", MODEL
+
+    return translated, response.model_version or MODEL
+
+
+if __name__ == "__main__":
+    bot.run(translate, ready_message="Translation bot (Gemini) is online.")
