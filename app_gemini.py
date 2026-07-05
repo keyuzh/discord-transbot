@@ -1,5 +1,7 @@
 """Discord translation bot backed by Google Gemini, with X/Twitter link expansion."""
 
+from __future__ import annotations
+
 import asyncio
 import os
 import re
@@ -28,38 +30,92 @@ _TWEET_RE = re.compile(
 )
 
 
-async def _fetch_tweet(session: aiohttp.ClientSession, username: str, tweet_id: str) -> str:
+def _extract(tweet: dict) -> tuple[str, list[str]]:
+    """Pull (text, image urls) from a tweet object; videos fall back to a jpg cover."""
+    urls = [
+        m.get("url") if m.get("type") == "image" else m.get("thumbnail_url")
+        for m in tweet.get("media_extended") or []
+    ]
+    return tweet.get("text", ""), [u for u in urls if u]
+
+
+async def _fetch_tweet(
+    session: aiohttp.ClientSession, username: str, tweet_id: str
+) -> tuple[str, list[str]]:
     api_url = f"https://api.vxtwitter.com/{username}/status/{tweet_id}"
     bot.log.debug("Fetching tweet from %s", api_url)
     try:
         async with session.get(api_url) as response:
             if response.status == 200:
-                return (await response.json()).get("text", "")
+                data = await response.json()
+                text, urls = _extract(data)
+                if isinstance(qrt := data.get("qrt"), dict):  # quoted tweet, own object
+                    q_text, q_urls = _extract(qrt)
+                    if q_text:
+                        text = "\n".join(filter(None, [text, f"[Quoted tweet]: {q_text}"]))
+                    urls += q_urls
+                return text, urls
             bot.log.warning("Tweet fetch returned HTTP %s", response.status)
     except Exception:
         bot.log.exception("Tweet fetch failed")
-    return ""
+    return "", []
 
 
-async def _expand_tweets(content: str) -> str:
-    """Append the text of any X/Twitter links so the model can translate them."""
+async def _fetch_media(
+    session: aiohttp.ClientSession, url: str
+) -> tuple[bytes, str] | None:
+    """Download a tweet image as (bytes, mime); None if unsupported or too large."""
+    try:
+        async with session.get(url, allow_redirects=False) as response:
+            mime = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if response.status != 200 or mime not in bot.SUPPORTED_IMAGE_TYPES:
+                return None
+            if int(response.headers.get("Content-Length") or 0) > bot.MAX_IMAGE_BYTES:
+                return None
+            data = await response.read()
+            return (data, mime) if len(data) <= bot.MAX_IMAGE_BYTES else None
+    except Exception:
+        bot.log.exception("Media fetch failed: %s", url)
+        return None
+
+
+async def _expand_tweets(content: str, limit: int) -> tuple[str, list[tuple[bytes, str]]]:
+    """Return the message plus any X/Twitter text, and up to `limit` tweet images."""
     matches = _TWEET_RE.findall(content)[:MAX_TWEETS]
     if not matches:
-        return content
+        return content, []
 
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        texts = await asyncio.gather(*(_fetch_tweet(session, u, t) for u, t in matches))
+        tweets = await asyncio.gather(*(_fetch_tweet(session, u, t) for u, t in matches))
+        urls = [url for _, media in tweets for url in media][:limit]
+        media = await asyncio.gather(*(_fetch_media(session, u) for u in urls))
 
-    extracted = "\n\n".join(f"**[Extracted Tweet Text]:**\n{t}" for t in texts if t)
-    return f"{content}\n\n{extracted}" if extracted else content
+    extracted = "\n\n".join(f"**[Extracted Tweet Text]:**\n{t}" for t, _ in tweets if t)
+    text = f"{content}\n\n{extracted}" if extracted else content
+    return text, [m for m in media if m]
+
+
+def _within_budget(images: list[tuple[bytes, str]]) -> list[tuple[bytes, str]]:
+    """Cap the combined images by count and total size (attachments come first)."""
+    kept: list[tuple[bytes, str]] = []
+    total = 0
+    for data, mime in images:
+        if len(kept) >= bot.MAX_IMAGES or total + len(data) > bot.MAX_TOTAL_IMAGE_BYTES:
+            continue
+        kept.append((data, mime))
+        total += len(data)
+    return kept
 
 
 async def translate(
     content: str, target_language: str, images: list[tuple[bytes, str]]
 ) -> tuple[str, str]:
-    text = await _expand_tweets(content) if content else ""
-    parts = [types.Part.from_bytes(data=data, mime_type=mime) for data, mime in images]
+    text, tweet_images = await _expand_tweets(content, max(0, bot.MAX_IMAGES - len(images)))
+    parts = [
+        types.Part.from_bytes(data=data, mime_type=mime)
+        for data, mime in _within_budget(images + tweet_images)
+    ]
     contents = [text, *parts] if text else parts
 
     response = await client.aio.models.generate_content(
