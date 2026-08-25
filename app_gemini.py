@@ -29,6 +29,16 @@ _TWEET_RE = re.compile(
     r"/([A-Za-z0-9_]+)/status/([0-9]+)"
 )
 
+_PROFILE_RE = re.compile(
+    r"https?://(?:www\.)?"
+    r"(?:twitter\.com|x\.com|vxtwitter\.com|fxtwitter\.com|fixupx\.com|fixvx\.com)"
+    r"/([A-Za-z0-9_]{1,15})/?(?![\w/])"
+)
+_RESERVED_PATHS = {
+    "home", "search", "explore", "i", "intent", "hashtag", "settings",
+    "notifications", "messages", "compose", "login", "share",
+}
+
 
 def _extract(tweet: dict) -> tuple[str, list[str]]:
     """Pull (text, image urls) from a tweet object; videos fall back to a jpg cover."""
@@ -61,6 +71,20 @@ async def _fetch_tweet(
     return "", []
 
 
+async def _fetch_profile(session: aiohttp.ClientSession, username: str) -> str:
+    api_url = f"https://api.fxtwitter.com/{username}"
+    bot.log.debug("Fetching profile from %s", api_url)
+    try:
+        async with session.get(api_url) as response:
+            if response.status == 200:
+                user = (await response.json()).get("user") or {}
+                return "\n".join(filter(None, [user.get("name"), user.get("description")]))
+            bot.log.warning("Profile fetch returned HTTP %s", response.status)
+    except Exception:
+        bot.log.exception("Profile fetch failed")
+    return ""
+
+
 async def _fetch_media(
     session: aiohttp.ClientSession, url: str
 ) -> tuple[bytes, str] | None:
@@ -82,16 +106,24 @@ async def _fetch_media(
 async def _expand_tweets(content: str, limit: int) -> tuple[str, list[tuple[bytes, str]]]:
     """Return the message plus any X/Twitter text, and up to `limit` tweet images."""
     matches = _TWEET_RE.findall(content)[:MAX_TWEETS]
-    if not matches:
+    usernames = [
+        u for u in _PROFILE_RE.findall(content) if u.lower() not in _RESERVED_PATHS
+    ][:MAX_TWEETS]
+    if not matches and not usernames:
         return content, []
 
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        tweets = await asyncio.gather(*(_fetch_tweet(session, u, t) for u, t in matches))
+        tweets, profiles = await asyncio.gather(
+            asyncio.gather(*(_fetch_tweet(session, u, t) for u, t in matches)),
+            asyncio.gather(*(_fetch_profile(session, u) for u in usernames)),
+        )
         urls = [url for _, media in tweets for url in media][:limit]
         media = await asyncio.gather(*(_fetch_media(session, u) for u in urls))
 
-    extracted = "\n\n".join(f"**[Extracted Tweet Text]:**\n{t}" for t, _ in tweets if t)
+    sections = [f"**[Extracted Tweet Text]:**\n{t}" for t, _ in tweets if t]
+    sections += [f"**[Extracted Profile Bio]:**\n{p}" for p in profiles if p]
+    extracted = "\n\n".join(sections)
     text = f"{content}\n\n{extracted}" if extracted else content
     return text, [m for m in media if m]
 
