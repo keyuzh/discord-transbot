@@ -1,206 +1,172 @@
+"""Discord translation bot backed by OpenRouter, with X/Twitter link expansion."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
 import os
-import discord
-from datetime import datetime
+import re
+
+import aiohttp
 from openrouter import OpenRouter
-from dotenv import load_dotenv
 
-# =========================
-# LOAD ENV
-# =========================
+import bot  # imports first so load_dotenv() runs before we read the key
 
-load_dotenv()
+API_KEY = bot.require_env("OPENROUTER_API_KEY")
+MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+# One client for the whole process; its httpx pool is reused across requests.
+client = OpenRouter(api_key=API_KEY)
 
-# =========================
-# DEBUG PRINT
-# =========================
+# Matches twitter/x and the usual mirror domains, capturing (username, status_id).
+_TWEET_RE = re.compile(
+    r"https?://(?:www\.)?"
+    r"(?:twitter\.com|x\.com|vxtwitter\.com|fxtwitter\.com|fixupx\.com|fixvx\.com)"
+    r"/([A-Za-z0-9_]+)/status/([0-9]+)"
+)
+MAX_TWEETS = 3
 
-def debug_log(message):
-    if DEBUG_MODE:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{timestamp}] [DEBUG] {message}")
-
-# =========================
-# DISCORD INTENTS
-# =========================
-
-intents = discord.Intents.default()
-
-intents.message_content = True
-intents.reactions = True
-intents.messages = True
-intents.guilds = True
-
-# =========================
-# DISCORD CLIENT
-# =========================
-
-client = discord.Client(intents=intents)
-
-#using the following codes if using a vpn with port7890
-#client = discord.Client(
-#    intents=intents,
-#    proxy="http://127.0.0.1:7890"
-#)
-
-# =========================
-# FLAG -> LANGUAGE
-# =========================
-
-LANGUAGES = {
-    "🇺🇸": "English",
-    "🇬🇧": "English",
-    "🇯🇵": "Japanese",
-    "🇨🇳": "Chinese",
-    "🇹🇼": "Chinese",
-    "🇰🇷": "Korean",
-    "🇫🇷": "French",
-    "🇪🇸": "Spanish",
-    "🇲🇽": "Spanish",
-    "🇩🇪": "German",
-    "🇷🇺": "Russian"
+# Matches bare profile links (no /status/...), capturing the username.
+_PROFILE_RE = re.compile(
+    r"https?://(?:www\.)?"
+    r"(?:twitter\.com|x\.com|vxtwitter\.com|fxtwitter\.com|fixupx\.com|fixvx\.com)"
+    r"/([A-Za-z0-9_]{1,15})/?(?![\w/])"
+)
+_RESERVED_PATHS = {
+    "home", "search", "explore", "i", "intent", "hashtag", "settings",
+    "notifications", "messages", "compose", "login", "share",
 }
 
-# =========================
-# CACHE
-# prevents duplicate translations
-# =========================
 
-translated_cache = set()
+def _extract(tweet: dict) -> tuple[str, list[str]]:
+    """Pull (text, image URLs) from a tweet; videos use their cover image."""
+    urls = [
+        media.get("url") if media.get("type") == "image" else media.get("thumbnail_url")
+        for media in tweet.get("media_extended") or []
+    ]
+    return tweet.get("text", ""), [url for url in urls if url]
 
-# =========================
-# READY EVENT
-# =========================
 
-@client.event
-async def on_ready():
-
-    print("=" * 50)
-    print(f"Logged in as {client.user}")
-    print("Translation bot is online.")
-    print("=" * 50)
-
-# =========================
-# REACTION EVENT
-# =========================
-
-@client.event
-async def on_raw_reaction_add(payload):
-
-    # ignore bot reactions
-    if payload.user_id == client.user.id:
-        return
-
-    emoji = str(payload.emoji)
-    debug_log(f"Reaction received: {emoji} from user {payload.user_id}")
-
-    # Handle ping command
-    if emoji == "🏓":
-        latency = round(client.latency * 1000)
-        debug_log(f"Ping requested. Latency: {latency}ms")
-        
-        channel = client.get_channel(payload.channel_id)
-        if channel:
-            message = await channel.fetch_message(payload.message_id)
-            await message.reply(f"🏓 Pong! Latency: **{latency}ms**")
-        return
-
-    # only process flag emojis
-    if emoji not in LANGUAGES:
-        debug_log(f"Emoji {emoji} not in supported LANGUAGES.")
-        return
-
-    cache_key = (payload.message_id, emoji)
-
-    # prevent duplicate translations
-    if cache_key in translated_cache:
-        debug_log(f"Translation for {cache_key} already in cache. Skipping.")
-        return
-
-    translated_cache.add(cache_key)
-
+async def _fetch_tweet(
+    session: aiohttp.ClientSession, username: str, tweet_id: str
+) -> tuple[str, list[str]]:
+    """Fetch tweet text and media from the public vxtwitter API."""
+    api_url = f"https://api.vxtwitter.com/{username}/status/{tweet_id}"
+    bot.log.debug("Fetching tweet from %s", api_url)
     try:
-        # get channel
-        channel = client.get_channel(payload.channel_id)
+        async with session.get(api_url) as response:
+            if response.status == 200:
+                data = await response.json()
+                text, urls = _extract(data)
+                if isinstance(quoted_tweet := data.get("qrt"), dict):
+                    quoted_text, quoted_urls = _extract(quoted_tweet)
+                    if quoted_text:
+                        text = "\n".join(
+                            filter(None, [text, f"[Quoted tweet]: {quoted_text}"])
+                        )
+                    urls += quoted_urls
+                return text, urls
+            bot.log.warning("Tweet fetch returned HTTP %s", response.status)
+    except Exception:
+        bot.log.exception("Tweet fetch failed")
+    return "", []
 
-        if channel is None:
-            debug_log(f"Channel {payload.channel_id} not found.")
-            return
 
-        # fetch original message
-        debug_log(f"Fetching message {payload.message_id}...")
-        message = await channel.fetch_message(payload.message_id)
+async def _fetch_profile(session: aiohttp.ClientSession, username: str) -> str:
+    """Fetch a profile's display name and bio from the public fxtwitter API."""
+    api_url = f"https://api.fxtwitter.com/{username}"
+    bot.log.debug("Fetching profile from %s", api_url)
+    try:
+        async with session.get(api_url) as response:
+            if response.status == 200:
+                user = (await response.json()).get("user") or {}
+                return "\n".join(filter(None, [user.get("name"), user.get("description")]))
+            bot.log.warning("Profile fetch returned HTTP %s", response.status)
+    except Exception:
+        bot.log.exception("Profile fetch failed")
+    return ""
 
-        # ignore bot messages
-        if message.author.bot:
-            debug_log("Ignoring bot message.")
-            return
 
-        # ignore empty messages
-        if not message.content:
-            debug_log("Ignoring empty message content.")
-            return
+async def _fetch_media(
+    session: aiohttp.ClientSession, url: str
+) -> tuple[bytes, str] | None:
+    """Download a supported tweet image, returning None for invalid/oversized media."""
+    try:
+        async with session.get(url, allow_redirects=False) as response:
+            mime = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if response.status != 200 or mime not in bot.SUPPORTED_IMAGE_TYPES:
+                return None
+            if int(response.headers.get("Content-Length") or 0) > bot.MAX_IMAGE_BYTES:
+                return None
+            data = await response.read()
+            return (data, mime) if len(data) <= bot.MAX_IMAGE_BYTES else None
+    except Exception:
+        bot.log.exception("Media fetch failed: %s", url)
+    return None
 
-        target_language = LANGUAGES[emoji]
 
-        print(f"Translating to {target_language}")
-        debug_log(f"Original content: {message.content[:50]}...")
+async def _expand_tweets(content: str, limit: int) -> tuple[str, list[tuple[bytes, str]]]:
+    """Append X/Twitter post text and profile bios; return up to ``limit`` linked images."""
+    matches = _TWEET_RE.findall(content)[:MAX_TWEETS]
+    usernames = [
+        name for name in _PROFILE_RE.findall(content)
+        if name.lower() not in _RESERVED_PATHS
+    ][:MAX_TWEETS]
+    if not matches and not usernames:
+        return content, []
 
-        # =========================
-        # CALL OPENROUTER API (SDK)
-        # =========================
-
-        api_model = "openrouter/free"
-
-        debug_log(f"Calling OpenRouter API for model: {api_model}")
-        
-        async with OpenRouter(api_key=OPENROUTER_API_KEY) as ai:
-            response = await ai.chat.send_async(
-                model=api_model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": f"Translate to {target_language}. Preserve tone, slang, and formatting. Output ONLY the translation."
-                    },
-                    {
-                        "role": "user",
-                        "content": message.content
-                    }
-                ],
-                temperature=0.3
-            )
-
-        translated = response.choices[0].message.content
-        actual_model = response.model
-        debug_log(f"Translation received from {actual_model}: {translated[:50]}...")
-
-        # =========================
-        # EMBED
-        # =========================
-
-        embed = discord.Embed(
-            title=f"{emoji} Translation",
-            description=translated
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        tweets, profiles = await asyncio.gather(
+            asyncio.gather(*(_fetch_tweet(session, user, post) for user, post in matches)),
+            asyncio.gather(*(_fetch_profile(session, user) for user in usernames)),
         )
+        urls = [url for _, media in tweets for url in media][:limit]
+        media = await asyncio.gather(*(_fetch_media(session, url) for url in urls))
 
-        embed.set_footer(text=f"Model: {actual_model}")
+    sections = [f"**[Extracted Tweet Text]:**\n{text}" for text, _ in tweets if text]
+    sections += [f"**[Extracted Profile Bio]:**\n{bio}" for bio in profiles if bio]
+    extracted = "\n\n".join(sections)
+    text = f"{content}\n\n{extracted}" if extracted else content
+    return text, [item for item in media if item]
 
-        # reply to original message
-        debug_log(f"Replying to message {payload.message_id} with translation.")
-        await message.reply(embed=embed)
 
-    except Exception as e:
+def _within_budget(images: list[tuple[bytes, str]]) -> list[tuple[bytes, str]]:
+    """Cap combined image count and size, prioritizing Discord attachments."""
+    kept: list[tuple[bytes, str]] = []
+    total = 0
+    for data, mime in images:
+        if len(kept) >= bot.MAX_IMAGES or total + len(data) > bot.MAX_TOTAL_IMAGE_BYTES:
+            continue
+        kept.append((data, mime))
+        total += len(data)
+    return kept
 
-        print("Translation error:")
-        print(e)
-        debug_log(f"Exception details: {type(e).__name__}: {str(e)}")
 
-# =========================
-# START BOT
-# =========================
+async def translate(
+    content: str, target_language: str, images: list[tuple[bytes, str]]
+) -> tuple[str, str]:
+    content, tweet_images = await _expand_tweets(
+        content, max(0, bot.MAX_IMAGES - len(images))
+    )
+    user_content = []
+    if content:
+        user_content.append({"type": "text", "text": content})
+    for data, mime in _within_budget(images + tweet_images):
+        data_uri = f"data:{mime};base64,{base64.b64encode(data).decode()}"
+        user_content.append({"type": "image_url", "image_url": {"url": data_uri}})
 
-if __name__ == '__main__':
-    client.run(DISCORD_TOKEN)
+    response = await client.chat.send_async(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": bot.build_prompt(target_language)},
+            {"role": "user", "content": user_content},
+        ],
+        temperature=0.3,
+    )
+    text = response.choices[0].message.content if response.choices else None
+    return (text or ""), response.model
+
+
+if __name__ == "__main__":
+    bot.run(translate, ready_message="Translation bot (OpenRouter) is online.")
