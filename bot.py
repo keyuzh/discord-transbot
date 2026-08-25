@@ -26,9 +26,10 @@ logging.getLogger("discord").setLevel(logging.WARNING)
 log = logging.getLogger("transbot")
 
 LANGUAGES = {
-    "🇺🇸": "English", "🇬🇧": "English",
+    "🇺🇸": "English", "🇬🇧": "UK English",
     "🇯🇵": "Japanese",
-    "🇨🇳": "Chinese", "🇹🇼": "Chinese",
+    "🇨🇳": "Chinese", "🇹🇼": "Traditional Chinese (Taiwan)",
+    "🇭🇰": "Cantonese",
     "🇰🇷": "Korean",
     "🇫🇷": "French",
     "🇪🇸": "Spanish", "🇲🇽": "Spanish",

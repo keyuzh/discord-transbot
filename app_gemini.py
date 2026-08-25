@@ -13,7 +13,7 @@ from google.genai import types
 import bot  # imports first so load_dotenv() runs before we read the key
 
 API_KEY = bot.require_env("GEMINI_API_KEY")
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+MODEL = os.getenv("GEMINI_MODEL")
 MAX_TWEETS = 3
 
 # One client for the whole process; its connection pool is reused across requests.
@@ -118,13 +118,45 @@ async def translate(
     ]
     contents = [text, *parts] if text else parts
 
-    response = await client.aio.models.generate_content(
-        model=MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=bot.build_prompt(target_language), **_GEN_PARAMS
-        ),
-    )
+    start_time = asyncio.get_running_loop().time()
+    delay = 10.0  # initial delay in seconds
+
+    while True:
+        try:
+            response = await client.aio.models.generate_content(
+                model=MODEL,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=bot.build_prompt(target_language), **_GEN_PARAMS
+                ),
+            )
+            break
+        except google.genai.errors.ServerError as e:
+            if getattr(e, "code", None) not in (500, 503):
+                raise
+            elapsed = asyncio.get_running_loop().time() - start_time
+            if elapsed >= 300:  # 5 minutes
+                bot.log.error("Gemini API returned HTTP %s after 5 minutes of retries, stopping.", e.code)
+                raise
+            bot.log.warning("Gemini API returned HTTP %s, retrying in %.1fs (elapsed: %.1fs)...", e.code, delay, elapsed)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 10.0)
+        except Exception as e:
+            # Check if it's a generic APIError or has status code 500/503
+            code = getattr(e, "code", None)
+            if code not in (500, 503):
+                # Also check response status code if available
+                resp = getattr(e, "response", None)
+                code = getattr(resp, "status", getattr(resp, "status_code", code))
+            if code not in (500, 503):
+                raise
+            elapsed = asyncio.get_running_loop().time() - start_time
+            if elapsed >= 300:
+                bot.log.error("Gemini API returned HTTP %s after 5 minutes of retries, stopping.", code)
+                raise
+            bot.log.warning("Gemini API returned HTTP %s, retrying in %.1fs (elapsed: %.1fs)...", code, delay, elapsed)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 10.0)
 
     # `.text` is None when the reply was blocked or has no text parts.
     translated = response.text
