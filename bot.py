@@ -5,7 +5,6 @@ coroutine; this module handles Discord wiring: flag reactions, de-duplication,
 embeds and the ping command.
 """
 
-import asyncio
 import logging
 import os
 from typing import Awaitable, Callable
@@ -44,15 +43,9 @@ SUPPORTED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/webp"}
 MAX_IMAGES = 4
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES = 16 * 1024 * 1024
-TRANSLATION_THREAD_NAME = "Translations"
 
 # Backend contract: async (content, target_language, images=[(bytes, mime)]) -> (text, model).
 Translator = Callable[[str, str, list[tuple[bytes, str]]], Awaitable[tuple[str, str]]]
-
-# Different flag reactions on one message may be handled concurrently.  Keep
-# thread creation serialized per source message so those translations all land
-# in one thread.
-_thread_locks: TTLCache = TTLCache(maxsize=10_000, ttl=3600)
 
 
 def require_env(name: str) -> str:
@@ -106,29 +99,10 @@ async def _collect_images(message: discord.Message) -> list[tuple[bytes, str]]:
     return images
 
 
-async def _get_translation_thread(message: discord.Message) -> discord.Thread:
-    """Return the source message's translation thread, creating it if needed."""
-    lock = _thread_locks.get(message.id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _thread_locks[message.id] = lock
-
-    async with lock:
-        # `message.thread` is populated when Discord included the thread in the
-        # message payload. The guild cache covers messages fetched without it.
-        thread = message.thread
-        if thread is None and message.guild is not None:
-            thread = message.guild.get_thread(message.id)
-        if thread is not None:
-            return thread
-
-        return await message.create_thread(name=TRANSLATION_THREAD_NAME)
-
-
 async def _reply_translation(
     translate: Translator, message: discord.Message, emoji: str
 ) -> bool:
-    """Translate the message and post the result in its translation thread."""
+    """Translate the message and reply. Returns True if a reply was sent."""
     if message.author.bot:
         return False
 
@@ -136,8 +110,7 @@ async def _reply_translation(
     if not message.content and not images:
         if message.attachments:
             kinds = ", ".join(sorted(t.split("/")[1] for t in SUPPORTED_IMAGE_TYPES))
-            thread = await _get_translation_thread(message)
-            await thread.send(
+            await message.reply(
                 f"⚠️ No text or supported image found "
                 f"({kinds}, ≤{MAX_IMAGE_BYTES // 1024 // 1024} MB each)."
             )
@@ -159,8 +132,7 @@ async def _reply_translation(
 
     embed = discord.Embed(title=f"{emoji} Translation", description=translated)
     embed.set_footer(text=f"Model: {model_label}")
-    thread = await _get_translation_thread(message)
-    await thread.send(embed=embed)
+    await message.reply(embed=embed)
     return True
 
 
