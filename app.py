@@ -13,7 +13,18 @@ from openrouter import OpenRouter
 import bot  # imports first so load_dotenv() runs before we read the key
 
 API_KEY = bot.require_env("OPENROUTER_API_KEY")
-MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
+# Models are tried in this order by OpenRouter.  Keep OPENROUTER_MODEL as a
+# backwards-compatible single-model setting, but prefer a comma-separated
+# OPENROUTER_MODELS list (for example: "google/gemini-2.5-flash,openrouter/free").
+MODELS = [
+    model.strip()
+    for model in os.getenv(
+        "OPENROUTER_MODELS", os.getenv("OPENROUTER_MODEL", "openrouter/free")
+    ).split(",")
+    if model.strip()
+]
+if not MODELS:
+    raise RuntimeError("OPENROUTER_MODELS must contain at least one model")
 
 # One client for the whole process; its httpx pool is reused across requests.
 client = OpenRouter(api_key=API_KEY)
@@ -157,7 +168,7 @@ async def translate(
         user_content.append({"type": "image_url", "image_url": {"url": data_uri}})
 
     response = await client.chat.send_async(
-        model=MODEL,
+        models=MODELS,
         messages=[
             {"role": "system", "content": bot.build_prompt(target_language)},
             {"role": "user", "content": user_content},
