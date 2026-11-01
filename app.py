@@ -13,9 +13,9 @@ from openrouter import OpenRouter
 import bot  # imports first so load_dotenv() runs before we read the key
 
 API_KEY = bot.require_env("OPENROUTER_API_KEY")
-# Models are tried in this order by OpenRouter.  Keep OPENROUTER_MODEL as a
-# backwards-compatible single-model setting, but prefer a comma-separated
-# OPENROUTER_MODELS list (for example: "google/gemini-2.5-flash,openrouter/free").
+# Models are tried in this order. Keep OPENROUTER_MODEL as a backwards-compatible
+# single-model setting, but prefer a comma-separated OPENROUTER_MODELS list (for
+# example: "google/gemini-2.5-flash,openrouter/free").
 MODELS = [
     model.strip()
     for model in os.getenv(
@@ -167,16 +167,27 @@ async def translate(
         data_uri = f"data:{mime};base64,{base64.b64encode(data).decode()}"
         user_content.append({"type": "image_url", "image_url": {"url": data_uri}})
 
-    response = await client.chat.send_async(
-        models=MODELS,
-        messages=[
-            {"role": "system", "content": bot.build_prompt(target_language)},
-            {"role": "user", "content": user_content},
-        ],
-        temperature=0.3,
-    )
-    text = response.choices[0].message.content if response.choices else None
-    return (text or ""), response.model
+    messages = [
+        {"role": "system", "content": bot.build_prompt(target_language)},
+        {"role": "user", "content": user_content},
+    ]
+    for model in MODELS:
+        try:
+            response = await client.chat.send_async(
+                model=model,
+                messages=messages,
+                temperature=0.3,
+            )
+        except Exception:
+            bot.log.exception("OpenRouter model %s failed; trying the next model", model)
+            continue
+
+        text = response.choices[0].message.content if response.choices else None
+        if text and text.strip():
+            return text, response.model
+        bot.log.warning("OpenRouter model %s returned an empty translation", model)
+
+    return "", MODELS[-1]
 
 
 if __name__ == "__main__":

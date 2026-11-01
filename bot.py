@@ -61,7 +61,9 @@ def build_prompt(target_language: str) -> str:
     return (
         f"Translate any text in the message and images to {target_language}. "
         "If an image has no text, briefly describe it in that language. "
-        "Preserve tone, slang, and formatting. Output ONLY the translation."
+        "Preserve tone, slang, and formatting. Output ONLY the translation. "
+        "If you cannot translate the entire message for any reason, return an "
+        "empty response: do not explain, apologize, or describe the refusal."
     )
 
 
